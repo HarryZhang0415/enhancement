@@ -3,6 +3,8 @@ import sys
 import time
 from collections import defaultdict
 from threading import current_thread
+import networkx as nx
+import matplotlib.pyplot as plt
 
 class CLEAR(object):
   """Placeholder to use for a cleared value"""
@@ -51,9 +53,14 @@ class Graph(object):
         self._debug_mode = False
         self._gather_performance = False
         self._timings = defaultdict(list)
+        self._nx_graph = nx.DiGraph()  # Initialize NetworkX directed graph
 
     def is_calculating(self):
-        return self.active_state.active_child is not None
+        # Check if any vertex in the current state stack is being calculated
+        for state in self._state_stack:
+            if state.active_child is not None:
+                return True
+        return False
 
     @property
     def timings(self):
@@ -120,6 +127,8 @@ class Graph(object):
             self.active_state.active_child = vertex
             with self.time_it(vertex):
                 payload.value = vertex.evaluate()
+                # Ensure vertex is added to graph when evaluated
+                self._nx_graph.add_node(vertex._id, value=payload.value)
         finally:
             self.active_state.active_child = saved_child
         
@@ -146,7 +155,7 @@ class Graph(object):
         return payload.is_fixed()
 
     def set_value(self, vertex, value):
-        if vertex in self.active_state and self.is_calculating():
+        if self.is_calculating():
             raise RuntimeError('Graph cannot be modified while its updating its state')
         
         if value == CLEAR:
@@ -198,6 +207,72 @@ class Graph(object):
         
         del self.active_state[vertex]
         self._invalidate_children(vertex)
+
+    def to_networkx(self):
+        """Convert the current graph state to a NetworkX graph for analysis"""
+        self._nx_graph.clear()
+        
+        # Add all vertices as nodes
+        for vertex, payload in self.active_state.items():
+            self._nx_graph.add_node(vertex._id, value=payload.value if payload.is_valid() else None)
+        
+        # Add edges based on parent-child relationships
+        for vertex, payload in self.active_state.items():
+            vertex = payload.vertex
+            for child in vertex.children:
+                self._nx_graph.add_edge(vertex._id, child._id)
+        
+        return self._nx_graph
+
+    def visualize(self, figsize=(10, 8), with_labels=True):
+        """Visualize the graph using NetworkX and matplotlib"""
+        plt.figure(figsize=figsize)
+        graph = self.to_networkx()
+        pos = nx.spring_layout(graph)
+        nx.draw(graph, pos, with_labels=with_labels, node_color='lightblue', 
+                node_size=1500, arrowsize=20)
+        plt.show()
+
+    def get_cycles(self):
+        """Detect cycles in the graph"""
+        return list(nx.simple_cycles(self.to_networkx()))
+
+    def get_topological_sort(self):
+        """Return nodes in topological sort order"""
+        try:
+            return list(nx.topological_sort(self.to_networkx()))
+        except nx.NetworkXUnfeasible:
+            raise RuntimeError("Graph contains cycles and cannot be topologically sorted")
+
+    def get_shortest_path(self, source, target):
+        """Find shortest path between two vertices"""
+        source_id = self.get_vertex_id(source)
+        target_id = self.get_vertex_id(target)
+        try:
+            return nx.shortest_path(self.to_networkx(), source_id, target_id)
+        except nx.NetworkXNoPath:
+            return None
+
+    def get_all_paths(self, source, target):
+        """Find all paths between two vertices"""
+        source_id = self.get_vertex_id(source)
+        target_id = self.get_vertex_id(target)
+        return list(nx.all_simple_paths(self.to_networkx(), source_id, target_id))
+
+    def get_vertex_id(self, vertex):
+        """Get the string identifier for a vertex"""
+        if isinstance(vertex, str):
+            return vertex
+        if isinstance(vertex, GraphVertex):
+            return vertex._id
+        raise ValueError("Input must be either a vertex ID string or GraphVertex object")
+
+    def ensure_vertex_evaluated(self, vertex):
+        """Ensure a vertex is evaluated and added to the graph"""
+        if isinstance(vertex, GraphVertex):
+            self.get_value(vertex)  # This will evaluate the vertex if needed
+            for child in vertex.children:
+                self.ensure_vertex_evaluated(child)
 
 _graph = Graph()
 
@@ -304,7 +379,7 @@ class GraphVertex(object):
                 hacked_tb = hacked_tb.tb_next
                 if hacked_tb is None:
                     break
-            raise(ex_type, ex, hacked_tb or ex_tb)
+            raise ex.with_traceback(hacked_tb or ex_tb)
         if self._graph.is_debug_mode:
             print("{}() -> {}".format(self._id, value))
         return value
@@ -477,14 +552,46 @@ if __name__ == '__main__':
         def area(self):
             return self.length() * self.width()
         
+    # Create example instances
     eg = Example()
     aeg = AnotherExample(eg)
 
-    print(eg.length())
-    print(eg.area())
-    print(aeg.area())
+    # Test basic functionality and ensure graph is populated
+    print("Basic calculations:")
+    print(f"Example length: {eg.length()}")
+    print(f"Example area: {eg.area()}")
+    print(f"Example volume: {eg.volume()}")
+    print(f"AnotherExample area: {aeg.area()}")
 
+    # Demonstrate graph analysis capabilities
+    print("\nGraph Analysis:")
+    
+    # Get topological sort
+    print("Topological sort:", _graph.get_topological_sort())
+    
+    # Check for cycles
+    cycles = _graph.get_cycles()
+    print("Cycles in graph:", "Yes" if cycles else "No")
+    
+    # Find paths between vertices
+    paths = _graph.get_all_paths(eg.length, eg.volume)
+    print("\nAll paths from length to volume:")
+    for path in paths:
+        print(" -> ".join(path))
+    
+    # Visualize the graph
+    print("\nVisualizing the graph structure...")
+    _graph.visualize()
+
+    # Modify and show changes
+    print("\nModifying graph:")
     eg.length.set_value(8)
-    print(eg.length())
-    print(eg.area())
-    print(aeg.area())
+    print(f"Updated Example length: {eg.length()}")
+    print(f"Updated Example area: {eg.area()}")
+    print(f"Updated AnotherExample area: {aeg.area()}")
+    
+    # Visualize the modified graph
+    print("\nVisualizing the modified graph structure...")
+    _graph.visualize()
+    
+    print("\nFinished")
